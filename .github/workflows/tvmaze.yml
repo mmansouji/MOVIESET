@@ -57,6 +57,33 @@ jobs:
           ssh-keyscan -H 100.69.32.67 >> "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
+      - name: Check remote tools
+        run: |
+          ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            amirlin2@100.69.32.67 '
+              command -v rsync >/dev/null || {
+                  echo "FAILED: rsync is not installed on destination"
+                  exit 1
+              }
+
+              TARGET="$HOME/oscartv-data-pool/raw/2026-09-03/series/tvmaze/episodes"
+
+              test -d "$TARGET" || {
+                  echo "FAILED: target directory missing"
+                  exit 1
+              }
+
+              test -w "$TARGET" || {
+                  echo "FAILED: target directory not writable"
+                  exit 1
+              }
+
+              echo "REMOTE_READY"
+            '
+
       - name: Get existing TVMaze show files
         run: |
           ssh \
@@ -101,12 +128,69 @@ jobs:
           printf "shard=${{ matrix.shard }} missing_ids="
           wc -l < "$RUNNER_TEMP/tvmaze/show-ids.txt"
 
-      - name: Download TVMaze episodes
+      - name: Download and periodically sync
         env:
           TVMAZE_ROOT: ${{ runner.temp }}/tvmaze/output
           TVMAZE_IDS: ${{ runner.temp }}/tvmaze/show-ids.txt
         run: |
-          scripts/download-tvmaze-episodes.sh
+          ROOT="$RUNNER_TEMP/tvmaze/output"
+          LOCAL="$ROOT/episodes"
+
+          REMOTE_DIR="/home/amirlin2/oscartv-data-pool/raw/2026-09-03/series/tvmaze/episodes"
+
+          mkdir -p "$LOCAL"
+
+          sync_now() {
+              echo
+              echo "=== RSYNC $(date -Is) ==="
+
+              rsync \
+                -a \
+                --ignore-existing \
+                --partial \
+                --exclude='.*.part' \
+                --stats \
+                -e "ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=15" \
+                "$LOCAL/" \
+                "amirlin2@100.69.32.67:$REMOTE_DIR/"
+          }
+
+          scripts/download-tvmaze-episodes.sh &
+          DL_PID=$!
+
+          echo "downloader_pid=$DL_PID"
+
+          while kill -0 "$DL_PID" 2>/dev/null; do
+              sleep 120
+
+              if kill -0 "$DL_PID" 2>/dev/null; then
+                  sync_now || echo "WARNING: periodic rsync failed; download continues"
+              fi
+          done
+
+          if wait "$DL_PID"; then
+              DL_RC=0
+          else
+              DL_RC=$?
+          fi
+
+          echo
+          echo "download_rc=$DL_RC"
+          echo "=== FINAL RSYNC ==="
+
+          if sync_now; then
+              SYNC_RC=0
+          else
+              SYNC_RC=$?
+          fi
+
+          echo "final_sync_rc=$SYNC_RC"
+
+          if [ "$DL_RC" -ne 0 ]; then
+              exit "$DL_RC"
+          fi
+
+          exit "$SYNC_RC"
 
       - name: Show local result
         if: always()
@@ -124,33 +208,21 @@ jobs:
           du -sh "$ROOT/episodes" 2>/dev/null || true
 
           echo
-          tail -20 "$ROOT/episodes-download.log" 2>/dev/null || true
-
-      - name: Send episodes to OscarTV host
-        if: success()
-        run: |
-          LOCAL="$RUNNER_TEMP/tvmaze/output/episodes/"
-          REMOTE="/home/amirlin2/oscartv-data-pool/raw/2026-09-03/series/tvmaze/episodes/"
-
-          rsync \
-            -a \
-            --ignore-existing \
-            --stats \
-            -e "ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes" \
-            "$LOCAL" \
-            "amirlin2@100.69.32.67:$REMOTE"
+          tail -30 "$ROOT/episodes-download.log" 2>/dev/null || true
 
       - name: Send shard logs
         if: always()
         run: |
           ROOT="$RUNNER_TEMP/tvmaze/output"
 
+          REMOTE_LOG="/home/amirlin2/oscartv-data-pool/raw/2026-09-03/series/tvmaze/logs/github-actions/${GITHUB_RUN_ID}/shard-${{ matrix.shard }}"
+
           ssh \
             -i "$HOME/.ssh/id_ed25519" \
             -o BatchMode=yes \
             amirlin2@100.69.32.67 \
-            "mkdir -p \
-            /home/amirlin2/oscartv-data-pool/raw/2026-09-03/series/tvmaze/logs/github-actions/${GITHUB_RUN_ID}/shard-${{ matrix.shard }}"
+            "mkdir -p '$REMOTE_LOG'" \
+            || true
 
           rsync \
             -a \
@@ -159,11 +231,11 @@ jobs:
             "$ROOT/episodes-failed.log" \
             "$ROOT/episodes-not-found.log" \
             "$ROOT/logs/" \
-            "amirlin2@100.69.32.67:/home/amirlin2/oscartv-data-pool/raw/2026-09-03/series/tvmaze/logs/github-actions/${GITHUB_RUN_ID}/shard-${{ matrix.shard }}/" \
+            "amirlin2@100.69.32.67:$REMOTE_LOG/" \
             || true
 
-      - name: Final remote count
-        if: success()
+      - name: Final remote status
+        if: always()
         run: |
           ssh \
             -i "$HOME/.ssh/id_ed25519" \
@@ -175,4 +247,4 @@ jobs:
               find "$TARGET" -maxdepth 1 -type f -name "*.json" | wc -l
 
               du -sh "$TARGET"
-            '
+            ' || true
