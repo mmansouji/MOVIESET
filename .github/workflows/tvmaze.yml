@@ -1,0 +1,178 @@
+name: TVMaze Full Episodes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: movieset-${{ github.run_id }}-${{ matrix.shard }}
+          ping: 100.69.32.67
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.MOVIESET_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+
+          ssh-keyscan -H 100.69.32.67 >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Get existing TVMaze show files
+        run: |
+          ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -o BatchMode=yes \
+            amirlin2@100.69.32.67 \
+            'find "$HOME/oscartv-data-pool/raw/2026-09-03/series/tvmaze/episodes" \
+              -maxdepth 1 \
+              -type f \
+              -name "*.json" \
+              -printf "%f\n"' \
+            | sed 's/\.json$//' \
+            | grep -E '^[0-9]+$' \
+            | sort -n \
+            > "$RUNNER_TEMP/existing-show-ids.txt" || true
+
+          printf "existing_remote_files="
+          wc -l < "$RUNNER_TEMP/existing-show-ids.txt"
+
+      - name: Build shard excluding existing files
+        run: |
+          mkdir -p "$RUNNER_TEMP/tvmaze"
+
+          awk \
+            -v shard="${{ matrix.shard }}" \
+            -v total=16 \
+            '
+              NR == FNR {
+                existing[$1] = 1
+                next
+              }
+
+              /^[0-9]+$/ {
+                if ((n++ % total) == shard && !existing[$1])
+                  print
+              }
+            ' \
+            "$RUNNER_TEMP/existing-show-ids.txt" \
+            input/show-ids-full.txt \
+            > "$RUNNER_TEMP/tvmaze/show-ids.txt"
+
+          printf "shard=${{ matrix.shard }} missing_ids="
+          wc -l < "$RUNNER_TEMP/tvmaze/show-ids.txt"
+
+      - name: Download TVMaze episodes
+        env:
+          TVMAZE_ROOT: ${{ runner.temp }}/tvmaze/output
+          TVMAZE_IDS: ${{ runner.temp }}/tvmaze/show-ids.txt
+        run: |
+          scripts/download-tvmaze-episodes.sh
+
+      - name: Show local result
+        if: always()
+        run: |
+          ROOT="$RUNNER_TEMP/tvmaze/output"
+
+          printf "downloaded_json_files="
+          find "$ROOT/episodes" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.json' \
+            2>/dev/null \
+            | wc -l
+
+          du -sh "$ROOT/episodes" 2>/dev/null || true
+
+          echo
+          tail -20 "$ROOT/episodes-download.log" 2>/dev/null || true
+
+      - name: Send episodes to OscarTV host
+        if: success()
+        run: |
+          LOCAL="$RUNNER_TEMP/tvmaze/output/episodes/"
+          REMOTE="/home/amirlin2/oscartv-data-pool/raw/2026-09-03/series/tvmaze/episodes/"
+
+          rsync \
+            -a \
+            --ignore-existing \
+            --stats \
+            -e "ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes" \
+            "$LOCAL" \
+            "amirlin2@100.69.32.67:$REMOTE"
+
+      - name: Send shard logs
+        if: always()
+        run: |
+          ROOT="$RUNNER_TEMP/tvmaze/output"
+
+          ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -o BatchMode=yes \
+            amirlin2@100.69.32.67 \
+            "mkdir -p \
+            /home/amirlin2/oscartv-data-pool/raw/2026-09-03/series/tvmaze/logs/github-actions/${GITHUB_RUN_ID}/shard-${{ matrix.shard }}"
+
+          rsync \
+            -a \
+            -e "ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes" \
+            "$ROOT/episodes-download.log" \
+            "$ROOT/episodes-failed.log" \
+            "$ROOT/episodes-not-found.log" \
+            "$ROOT/logs/" \
+            "amirlin2@100.69.32.67:/home/amirlin2/oscartv-data-pool/raw/2026-09-03/series/tvmaze/logs/github-actions/${GITHUB_RUN_ID}/shard-${{ matrix.shard }}/" \
+            || true
+
+      - name: Final remote count
+        if: success()
+        run: |
+          ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -o BatchMode=yes \
+            amirlin2@100.69.32.67 '
+              TARGET="$HOME/oscartv-data-pool/raw/2026-09-03/series/tvmaze/episodes"
+
+              printf "remote_json_files="
+              find "$TARGET" -maxdepth 1 -type f -name "*.json" | wc -l
+
+              du -sh "$TARGET"
+            '

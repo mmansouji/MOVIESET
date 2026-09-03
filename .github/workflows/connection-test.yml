@@ -1,0 +1,64 @@
+name: Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: movieset-test-${{ github.run_id }}
+          ping: 100.69.32.67
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.MOVIESET_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+
+          ssh-keyscan -H 100.69.32.67 >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Test OscarTV host
+        run: |
+          ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            amirlin2@100.69.32.67 '
+              TARGET="$HOME/oscartv-data-pool/raw/2026-09-03/series/tvmaze/episodes"
+
+              echo "HOST=$(hostname)"
+              echo "USER=$(whoami)"
+              echo "TARGET=$TARGET"
+
+              if [ ! -d "$TARGET" ]; then
+                  echo "FAILED: target directory not found"
+                  exit 1
+              fi
+
+              if [ ! -w "$TARGET" ]; then
+                  echo "FAILED: target directory is not writable"
+                  exit 1
+              fi
+
+              printf "existing_json_files="
+              find "$TARGET" -maxdepth 1 -type f -name "*.json" | wc -l
+
+              du -sh "$TARGET"
+
+              echo "SSH_AND_TARGET_OK"
+            '
